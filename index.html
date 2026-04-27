@@ -66,6 +66,50 @@ body {
 .live-label { color: #10b981; font-weight: 600; }
 .sep { color: rgba(255,255,255,.15); }
 
+/* ── LOCATION CHIP ── */
+.location-chip {
+  display: none;
+  align-items: center;
+  gap: 5px;
+  background: rgba(59,130,246,0.1);
+  border: 1px solid rgba(59,130,246,0.25);
+  border-radius: 20px;
+  padding: 3px 10px 3px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: #93c5fd;
+  animation: fadeIn .4s ease both;
+}
+.location-chip .pin-dot {
+  width: 6px; height: 6px;
+  background: #3b82f6;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+#locationText {
+  color: #bfdbfe;
+  font-weight: 500;
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.location-loading {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.loc-spin {
+  width: 10px; height: 10px;
+  border: 1.5px solid rgba(255,255,255,.1);
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+
 .header-right { display: flex; align-items: center; gap: 14px; }
 .last-updated {
   font-family: var(--font-mono); font-size: 11px; color: var(--muted);
@@ -394,6 +438,20 @@ body {
     </div>
     <span class="sep">|</span>
     <span>Sensor: <strong style="color:var(--text)" id="sensorIdHeader">--</strong></span>
+    <span class="sep" id="locationSep" style="display:none">|</span>
+
+    <!-- LOCATION LOADING INDICATOR -->
+    <div class="location-loading" id="locationLoading">
+      <div class="loc-spin"></div>
+      <span>Locating…</span>
+    </div>
+
+    <!-- LOCATION CHIP (shown after fetch) -->
+    <div class="location-chip" id="locationChip">
+      <div class="pin-dot"></div>
+      <span id="locationText">--</span>
+    </div>
+
     <span class="sep">|</span>
     <span id="dataSource">🛰️ Satellite + 📡 IoT</span>
   </div>
@@ -667,15 +725,9 @@ function getAQITheme(aqi) {
 // POLLUTANT STATUS
 // ══════════════════════════════════
 function pollStatus(val, thresholds) {
-  // thresholds: [good, moderate] — above moderate = poor
   if (val <= thresholds[0]) return { txt:'Good',     color:'#10b981', bg:'rgba(16,185,129,.12)' };
   if (val <= thresholds[1]) return { txt:'Moderate', color:'#f59e0b', bg:'rgba(245,158,11,.12)' };
   return                           { txt:'Poor',     color:'#ef4444', bg:'rgba(239,68,68,.1)'  };
-}
-
-function setBar(barId, val, max) {
-  const el = document.getElementById(barId);
-  if (el) el.style.width = Math.min((val/max)*100, 100) + '%';
 }
 
 function applyPollCard(prefix, val, max, thresholds, color) {
@@ -716,6 +768,50 @@ function applyIoT(numId, statusId, barId, val, max, barColor, statusFn) {
 }
 
 // ══════════════════════════════════
+// LOCATION — REVERSE GEOCODING
+// ══════════════════════════════════
+let _locationFetched = false;
+
+async function fetchLocationName(lat, lon) {
+  // Show loading spinner
+  const loadingEl = document.getElementById('locationLoading');
+  const chipEl    = document.getElementById('locationChip');
+  const sepEl     = document.getElementById('locationSep');
+
+  if (loadingEl) loadingEl.style.display = 'flex';
+
+  try {
+    const resp = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`,
+      {
+        headers: { 'Accept-Language': 'en', 'User-Agent': 'AiroSense/1.0' },
+        signal: AbortSignal.timeout(5000)
+      }
+    );
+    if (!resp.ok) throw new Error('Geocoding failed');
+    const data = await resp.json();
+    const addr = data.address || {};
+
+    // Build label: prefer city → town → village → suburb → county
+    const city    = addr.city || addr.town || addr.village || addr.suburb || addr.county || '';
+    const country = addr.country || '';
+    const label   = [city, country].filter(Boolean).join(', ');
+
+    if (label) {
+      const textEl = document.getElementById('locationText');
+      if (textEl) textEl.textContent = label;
+      if (chipEl) chipEl.style.display = 'flex';
+      if (sepEl)  sepEl.style.display  = 'inline';
+      _locationFetched = true;
+    }
+  } catch {
+    // silently fail — location is non-critical
+  } finally {
+    if (loadingEl) loadingEl.style.display = 'none';
+  }
+}
+
+// ══════════════════════════════════
 // HISTORY (TIME-BASED - LAST 1 HOUR)
 // ══════════════════════════════════
 const HIST_KEY = 'airosense_history_v2';
@@ -731,26 +827,20 @@ function getHistory() {
 
 function saveHistory(e) {
   const h = getHistory();
-
-  // add timestamp (force it if missing)
   e.timestamp = Date.now();
-
   h.push(e);
-
-  // keep only last 1 hour data
   const now = Date.now();
   const filtered = h.filter(item => now - item.timestamp <= ONE_HOUR);
-
   try {
     localStorage.setItem(HIST_KEY, JSON.stringify(filtered));
   } catch {}
 }
 
-// helper for chart
 function getLastHourHistory() {
   const now = Date.now();
   return getHistory().filter(item => now - item.timestamp <= ONE_HOUR);
 }
+
 // ══════════════════════════════════
 // RENDER
 // ══════════════════════════════════
@@ -816,119 +906,43 @@ function renderDashboard(data) {
 
   // — Chart —
   const canvas = document.getElementById('aqiChart');
+  if (canvas) {
+    const hist = getLastHourHistory();
+    const labels   = hist.map(i => i.time);
+    const aqiVals  = hist.map(i => i.aqi);
+    const pm25Vals = hist.map(i => i.pm25);
+    const pm10Vals = hist.map(i => i.pm10);
+    const iotVals  = hist.map(i => i.iotAir);
 
-if (canvas) {
-  const hist = getLastHourHistory();;
+    if (window._aqiChart?.destroy) window._aqiChart.destroy();
 
-  const labels = hist.map(i => i.time);
-
-  const aqiVals   = hist.map(i => i.aqi);
-  const pm25Vals  = hist.map(i => i.pm25);
-  const pm10Vals  = hist.map(i => i.pm10);
-  const iotVals   = hist.map(i => i.iotAir);
-
-  if (window._aqiChart?.destroy) window._aqiChart.destroy();
-
-  window._aqiChart = new Chart(canvas.getContext('2d'), {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'Overall AQI',
-          data: aqiVals,
-          borderColor: '#3b82f6',
-          backgroundColor: 'rgba(59,130,246,0.1)',
-          tension: 0.4,
-          fill: true,
-          borderWidth: 2,
-          pointRadius: 2
-        },
-        {
-          label: 'IoT AQI (Sensor)',
-          data: iotVals,
-          borderColor: '#10b981',
-          backgroundColor: 'rgba(16,185,129,0.08)',
-          tension: 0.4,
-          fill: true,
-          borderWidth: 2,
-          pointRadius: 2
-        },
-        {
-          label: 'PM2.5 (Satellite)',
-          data: pm25Vals,
-          borderColor: '#ef4444',
-          backgroundColor: 'rgba(239,68,68,0.08)',
-          tension: 0.4,
-          fill: false,
-          borderWidth: 2,
-          pointRadius: 2
-        },
-        {
-          label: 'PM10 (Satellite)',
-          data: pm10Vals,
-          borderColor: '#f59e0b',
-          backgroundColor: 'rgba(245,158,11,0.08)',
-          tension: 0.4,
-          fill: false,
-          borderWidth: 2,
-          pointRadius: 2
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      interaction: {
-        mode: 'index',
-        intersect: false
+    window._aqiChart = new Chart(canvas.getContext('2d'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label:'Overall AQI',      data:aqiVals,  borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,0.1)', tension:0.4, fill:true,  borderWidth:2, pointRadius:2 },
+          { label:'IoT AQI (Sensor)', data:iotVals,  borderColor:'#10b981', backgroundColor:'rgba(16,185,129,0.08)', tension:0.4, fill:true,  borderWidth:2, pointRadius:2 },
+          { label:'PM2.5 (Satellite)',data:pm25Vals, borderColor:'#ef4444', backgroundColor:'rgba(239,68,68,0.08)',  tension:0.4, fill:false, borderWidth:2, pointRadius:2 },
+          { label:'PM10 (Satellite)', data:pm10Vals, borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,0.08)',tension:0.4, fill:false, borderWidth:2, pointRadius:2 }
+        ]
       },
-      plugins: {
-        legend: {
-          labels: {
-            color: '#6b7a9a',
-            font: { family: 'DM Mono' }
-          }
+      options: {
+        responsive: true,
+        interaction: { mode:'index', intersect:false },
+        plugins: {
+          legend: { labels: { color:'#6b7a9a', font:{ family:'DM Mono' } } },
+          tooltip: { backgroundColor:'#0c1120', borderColor:'rgba(255,255,255,0.1)', borderWidth:1 }
         },
-        tooltip: {
-          backgroundColor: '#0c1120',
-          borderColor: 'rgba(255,255,255,0.1)',
-          borderWidth: 1
-        }
-      },
-      scales: {
-        x: {
-          ticks: {
-            color: '#6b7a9a',
-            font: { family: 'DM Mono' }
-          },
-          grid: {
-            color: 'rgba(255,255,255,0.05)'
-          }
-        },
-        y: {
-          beginAtZero: true,
-          max: 500,
-          ticks: {
-            color: '#6b7a9a',
-            font: { family: 'DM Mono' }
-          },
-          grid: {
-            color: 'rgba(255,255,255,0.05)'
-          }
+        scales: {
+          x: { ticks:{ color:'#6b7a9a', font:{ family:'DM Mono' } }, grid:{ color:'rgba(255,255,255,0.05)' } },
+          y: { beginAtZero:true, max:500, ticks:{ color:'#6b7a9a', font:{ family:'DM Mono' } }, grid:{ color:'rgba(255,255,255,0.05)' } }
         }
       }
-    }
-  });
-}
+    });
+  }
 
-  saveHistory({ 
-  time: timeStr, 
-  timestamp: Date.now(), 
-  aqi, 
-  pm25, 
-  pm10, 
-  iotAir: air 
-});
+  saveHistory({ time:timeStr, timestamp:Date.now(), aqi, pm25, pm10, iotAir:air });
 }
 
 // ══════════════════════════════════
@@ -978,17 +992,25 @@ async function loadData() {
       ({ lat, lon } = lastCoords);
     } else {
       try {
-        const pos = await new Promise((res,rej) =>
-          navigator.geolocation.getCurrentPosition(res, rej, {timeout:3000})
+        const pos = await new Promise((res, rej) =>
+          navigator.geolocation.getCurrentPosition(res, rej, { timeout: 5000 })
         );
-        lat = pos.coords.latitude; lon = pos.coords.longitude;
+        lat = pos.coords.latitude;
+        lon = pos.coords.longitude;
         lastCoords = { lat, lon };
-      } catch { lat = 28.61; lon = 77.23; }
+      } catch {
+        lat = 28.61; lon = 77.23;
+        lastCoords = { lat, lon };
+      }
+      // Fetch location name once we have coords (only on first load)
+      if (!_locationFetched) {
+        fetchLocationName(lat, lon);
+      }
     }
 
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), 10000);
-    const resp = await fetch(`${API_URL}?lat=${lat}&lon=${lon}`, {signal:ctrl.signal});
+    const resp = await fetch(`${API_URL}?lat=${lat}&lon=${lon}`, { signal: ctrl.signal });
     clearTimeout(tid);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
@@ -1002,6 +1024,8 @@ async function loadData() {
 
     // Demo fallback on first load
     if (!lastCoords) {
+      lastCoords = { lat: 28.61, lon: 77.23 };
+      if (!_locationFetched) fetchLocationName(28.61, 77.23);
       renderDashboard({
         aqi: 150, category: 'Moderate',
         pollutants: { pm2_5:75, pm10:120, so2:18, o3:42 },
